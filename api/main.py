@@ -2794,6 +2794,65 @@ async def debug_deploy_test(email: str, key: str = ""):
     return {"error": "No bot script found"}
 
 
+@app.get("/api/debug/fs-inspect")
+async def debug_fs_inspect(key: str = ""):
+    from api.config import ADMIN_PIN, BOTS_DIR, LOGS_DIR, DATA_DIR
+    import hashlib
+    if key != ADMIN_PIN:
+        raise HTTPException(403, "Forbidden")
+
+    result = {}
+
+    # Check what bot scripts exist and their sizes/mtimes
+    bots = []
+    if BOTS_DIR.exists():
+        for f in sorted(BOTS_DIR.rglob("*.py")):
+            try:
+                stat = f.stat()
+                # Read first and last 5 lines to confirm content
+                lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+                bots.append({
+                    "path": str(f),
+                    "size": stat.st_size,
+                    "lines": len(lines),
+                    "mtime": stat.st_mtime,
+                    "first_line": lines[0] if lines else "",
+                    "line_419": lines[418] if len(lines) > 418 else "N/A",
+                    "last_line": lines[-1] if lines else "",
+                })
+            except Exception as e:
+                bots.append({"path": str(f), "error": str(e)})
+    result["bots"] = bots
+
+    # Check what log files exist and their sizes
+    logs = []
+    if LOGS_DIR.exists():
+        for f in sorted(LOGS_DIR.glob("*.log")):
+            try:
+                stat = f.stat()
+                lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+                logs.append({
+                    "filename": f.name,
+                    "size": stat.st_size,
+                    "lines": len(lines),
+                    "mtime": stat.st_mtime,
+                    "last_3": lines[-3:] if lines else [],
+                })
+            except Exception as e:
+                logs.append({"filename": f.name, "error": str(e)})
+    result["logs"] = logs
+
+    # Check DB processes table
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT email, pid, status, master_script_path, log_path FROM processes ORDER BY id DESC LIMIT 5"
+    ).fetchall()
+    conn.close()
+    result["db_processes"] = [dict(r) for r in rows]
+
+    return result
+
+
 @app.post("/api/debug/clear-process")
 async def debug_clear_process(email: str, key: str = ""):
     """Clear stale running process records for a student. Admin only."""
