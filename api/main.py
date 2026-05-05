@@ -1133,6 +1133,222 @@ async def options_backtest_stream(request: Request):
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+# ── /api/options/backtest-fast  (Modal parallel slices) ─────────────────────
+
+@app.post("/api/options/backtest-fast")
+async def options_backtest_fast(request: Request):
+    """Options backtest accelerated via Modal parallel monthly slices.
+
+    For periods <= 60 days, falls back to the local engine (Modal cold-start
+    overhead exceeds any parallelism benefit for short windows).
+
+    Falls back to local engine if MODAL_TOKEN_ID is not set, or on any
+    Modal error (so the UI never shows a dead spinner).
+
+    Returns a standard SSE stream identical to /api/options/backtest so
+    the frontend needs no changes -- just point the request at this URL.
+    """
+    from datetime import date, timedelta, datetime as _dt
+    from api.database import _options_bt_cache_key, get_backtest_cache, set_backtest_cache
+
+    config = await request.json()
+
+    # ── Cache check (same key as slow route -- shared cache) ─────────────────
+    _cache_key = _options_bt_cache_key(config)
+    _cached = get_backtest_cache(_cache_key, ttl_hours=24)
+    if _cached is not None:
+        async def _cached_stream():
+            trade_log = _cached.get("trade_log", [])
+            metrics   = _cached.get("metrics", {})
+            yield f"data: {json.dumps({'type': 'start', 'total': len(trade_log), 'cached': True})}\n\n"
+            for trade in trade_log:
+                yield f"data: {json.dumps({'type': 'trade', 'trade': trade}, default=str)}\n\n"
+            yield f"data: {json.dumps({'type': 'complete', 'metrics': metrics, 'trade_log': trade_log, '_cached': True}, default=str)}\n\n"
+        return StreamingResponse(_cached_stream(), media_type="text/event-stream")
+
+    # ── Decide: Modal or local fallback ──────────────────────────────────────
+    modal_token_id = os.environ.get("MODAL_TOKEN_ID", "")
+    start_str = config.get("start_date", "")
+    end_str   = config.get("end_date", "")
+
+    use_modal = False
+    if modal_token_id and start_str and end_str:
+        try:
+            start_dt = _dt.strptime(start_str, "%Y-%m-%d").date()
+            end_dt   = _dt.strptime(end_str,   "%Y-%m-%d").date()
+            period_days = (end_dt - start_dt).days
+            use_modal = period_days > 60
+        except ValueError:
+            use_modal = False
+
+    if not use_modal:
+        # Delegate entirely to the local streaming engine
+        from api.options_backtest import run_options_backtest_stream
+        _collected_trades: list = []
+        _collected_metrics: dict = {}
+
+        def _local_stream():
+            nonlocal _collected_trades, _collected_metrics
+            for event in run_options_backtest_stream(config):
+                if event.get("type") == "trade":
+                    _collected_trades.append(event["trade"])
+                elif event.get("type") == "complete":
+                    _collected_metrics = event.get("metrics", {})
+                    try:
+                        set_backtest_cache(
+                            _cache_key,
+                            {"metrics": _collected_metrics, "trade_log": _collected_trades},
+                            strategy=config.get("strategy_type", ""),
+                            symbol=config.get("symbol", ""),
+                        )
+                    except Exception:
+                        pass
+                yield f"data: {json.dumps(event, default=str)}\n\n"
+
+        return StreamingResponse(_local_stream(), media_type="text/event-stream")
+
+    # ── Modal path ────────────────────────────────────────────────────────────
+    # Build monthly slices.  Each slice gets start_date/end_date narrowed to
+    # one calendar month.  We add max_dte days of lookahead to end_date so a
+    # trade entered on the last day of the month can still find its exit dates.
+    import calendar
+
+    def _month_slices(start: date, end: date, max_dte: int = 30) -> list[dict]:
+        slices = []
+        cur = date(start.year, start.month, 1)
+        idx = 0
+        while cur <= end:
+            last_day = calendar.monthrange(cur.year, cur.month)[1]
+            slice_start = max(start, cur)
+            slice_end_entry = min(end, date(cur.year, cur.month, last_day))
+            # Extend end by max_dte so exit-phase reads don't fall off a cliff
+            slice_end_data  = min(end + timedelta(days=max_dte),
+                                  date(cur.year, cur.month, last_day) + timedelta(days=max_dte))
+            slice_cfg = {**config,
+                         "start_date": slice_start.isoformat(),
+                         "end_date":   slice_end_entry.isoformat(),
+                         "_data_end":  slice_end_data.isoformat(),
+                         "_slice_index": idx}
+            slices.append(slice_cfg)
+            # Advance to next month
+            if cur.month == 12:
+                cur = date(cur.year + 1, 1, 1)
+            else:
+                cur = date(cur.year, cur.month + 1, 1)
+            idx += 1
+        return slices
+
+    start_dt = _dt.strptime(start_str, "%Y-%m-%d").date()
+    end_dt   = _dt.strptime(end_str,   "%Y-%m-%d").date()
+    target_dte = int(config.get("target_dte", 7))
+    slices = _month_slices(start_dt, end_dt, max_dte=max(target_dte + 5, 10))
+
+    total_months = len(slices)
+
+    async def _modal_stream():
+        import asyncio
+
+        yield f"data: {json.dumps({'type': 'start', 'total': total_months, 'message': f'Dispatching {total_months} parallel workers via Modal...'})}\n\n"
+
+        # Run Modal in a thread so we don't block the async event loop
+        loop = asyncio.get_event_loop()
+
+        def _run_modal():
+            try:
+                import os as _os
+                # Authenticate Modal from env vars (Railway injects these)
+                _os.environ.setdefault("MODAL_TOKEN_ID",     _os.environ.get("MODAL_TOKEN_ID", ""))
+                _os.environ.setdefault("MODAL_TOKEN_SECRET", _os.environ.get("MODAL_TOKEN_SECRET", ""))
+
+                from scripts.precompute_modal import run_backtest_slice
+                results = list(run_backtest_slice.map(slices, return_exceptions=True))
+                return results
+            except Exception as e:
+                return e
+
+        try:
+            results = await loop.run_in_executor(None, _run_modal)
+        except Exception as e:
+            # Modal failed entirely -- fall back to local engine
+            yield f"data: {json.dumps({'type': 'progress', 'done': 0, 'total': 0, 'message': f'Modal unavailable ({e}), running locally...'})}\n\n"
+            from api.options_backtest import run_options_backtest_stream
+            for event in run_options_backtest_stream(config):
+                yield f"data: {json.dumps(event, default=str)}\n\n"
+            return
+
+        # Modal returned an exception object (whole call failed)
+        if isinstance(results, Exception):
+            yield f"data: {json.dumps({'type': 'progress', 'done': 0, 'total': 0, 'message': f'Modal error ({results}), running locally...'})}\n\n"
+            from api.options_backtest import run_options_backtest_stream
+            for event in run_options_backtest_stream(config):
+                yield f"data: {json.dumps(event, default=str)}\n\n"
+            return
+
+        # Merge all slice trade lists, sorted by entry_date
+        all_trades = []
+        errors = []
+        for r in results:
+            if isinstance(r, Exception):
+                errors.append(str(r))
+            elif isinstance(r, dict):
+                if r.get("status") == "ok":
+                    all_trades.extend(r.get("trades", []))
+                else:
+                    errors.append(r.get("error", "unknown slice error"))
+
+        if errors:
+            yield f"data: {json.dumps({'type': 'progress', 'done': 0, 'total': 0, 'message': f'{len(errors)} slice(s) failed, results may be partial'})}\n\n"
+
+        # Sort by entry_date and remove any cross-boundary overlap
+        all_trades.sort(key=lambda t: t.get("entry_date", ""))
+        deduped = []
+        last_exit = ""
+        for t in all_trades:
+            if t.get("entry_date", "") > last_exit:
+                deduped.append(t)
+                last_exit = t.get("exit_date", t.get("entry_date", ""))
+
+        # Emit trades to frontend
+        for trade in deduped:
+            yield f"data: {json.dumps({'type': 'trade', 'trade': trade}, default=str)}\n\n"
+
+        # Recompute metrics over merged full timeline
+        try:
+            from api.options_backtest import _compute_metrics
+            starting = float(config.get("starting_capital", 10000))
+            capital = starting
+            equity = [{"date": start_str, "capital": capital}]
+            for t in deduped:
+                capital += t.get("pnl_net", 0)
+                equity.append({"date": t["exit_date"], "capital": round(capital, 2)})
+            skipped = {}
+            metrics = _compute_metrics(deduped, config, skipped, equity)
+        except Exception as e:
+            # Fallback: basic metrics if _compute_metrics import fails
+            pnls = [t.get("pnl_net", 0) for t in deduped]
+            metrics = {
+                "total_trades": len(deduped),
+                "total_pnl": round(sum(pnls), 2),
+                "win_rate": round(sum(1 for p in pnls if p > 0) / len(pnls) * 100, 2) if pnls else 0,
+                "_metrics_error": str(e),
+            }
+
+        # Store in SQLite cache
+        try:
+            set_backtest_cache(
+                _cache_key,
+                {"metrics": metrics, "trade_log": deduped},
+                strategy=config.get("strategy_type", ""),
+                symbol=config.get("symbol", ""),
+            )
+        except Exception:
+            pass
+
+        yield f"data: {json.dumps({'type': 'complete', 'metrics': metrics, 'trade_log': deduped, '_modal': True}, default=str)}\n\n"
+
+    return StreamingResponse(_modal_stream(), media_type="text/event-stream")
+
+
 @app.get("/api/options/cache/stats")
 async def options_cache_stats():
     """Disk-cache inventory: file counts + sizes per symbol."""
