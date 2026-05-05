@@ -613,6 +613,7 @@ label { display:block; font-size:12px; font-weight:600; color:var(--text-seconda
         </div>
       </div>
       <div class="form-group"><label>Strategy</label><input type="text" id="bd-set-strat" disabled style="background:var(--surface-2);color:var(--text-muted)"></div>
+      <div id="bd-params-container"></div>
       <div id="bd-set-msg" style="font-size:12px;min-height:18px;margin-bottom:8px"></div>
       <button class="btn btn-primary" onclick="saveBotSettings()">Save Changes</button>
       <div style="margin-top:32px;padding-top:16px;border-top:2px solid var(--red-light);border-radius:8px">
@@ -666,7 +667,7 @@ label { display:block; font-size:12px; font-weight:600; color:var(--text-seconda
       </div>
       <div class="form-group" id="bt-lib-strat">
         <label>Strategy</label>
-        <select id="bt-strategy"></select>
+        <select id="bt-strategy" onchange="btOnStrategyChange(this.value)"></select>
       </div>
       <div class="form-group">
         <label>Timeframe</label>
@@ -1666,11 +1667,12 @@ label { display:block; font-size:12px; font-weight:600; color:var(--text-seconda
         <div class="quicktags" id="nb-sym-qtags"></div>
       </div>
       <div class="form-group"><label>Strategy</label>
-        <select id="nb-strategy" style="width:100%">
+        <select id="nb-strategy" style="width:100%" onchange="nbOnStrategyChange(this.value)">
           <option value="__TEST__">Quick Test (Buy→Sell)</option>
         </select>
         <div class="form-hint" id="nb-strat-hint">Test strategy: buys immediately, sells on next bar</div>
       </div>
+      <div id="nb-params-container"></div>
       <div class="form-group"><label>Timeframe</label><select id="nb-timeframe"><option value="1min">1m</option><option value="5min">5m</option><option value="15min">15m</option><option value="1hour">1h</option><option value="4hour">4h</option><option value="1day" selected>1d</option></select></div>
       <div class="form-group"><label>Allocation ($)</label><input type="number" id="nb-alloc" value="1000"></div>
       <div class="form-group"><label>Bot Name</label><input type="text" id="nb-name" placeholder="My Bot"></div>
@@ -2045,11 +2047,140 @@ async function loadLibrary() {
 function populateStrategySelects() {
   if (!LIB_CACHE) return;
   const btSel = document.getElementById('bt-strategy');
-  if (btSel) btSel.innerHTML = LIB_CACHE.map(s => `<option value="${s.id}">${s.name}</option>`).join('');
+  if (btSel) {
+    btSel.innerHTML = LIB_CACHE.map(s => `<option value="${s.id}">${s.name}</option>`).join('');
+    // Render params for default selected strategy
+    btOnStrategyChange(btSel.value);
+  }
   const nbSel = document.getElementById('nb-strategy');
   if (nbSel) {
     nbSel.innerHTML = '<option value="__TEST__">Quick Test (Buy→Sell)</option>' + LIB_CACHE.map(s => `<option value="${s.id}">${s.name}</option>`).join('');
   }
+}
+
+// ── Strategy param definitions ──────────────────────────────────────────────
+// Labels and types for known param keys. Any key not listed falls back to
+// a generic number input with a title-cased label.
+const PARAM_META = {
+  grid_levels:       { label: 'Grid Levels',        type: 'int',   min: 1, max: 20,  step: 1,    hint: 'Number of buy orders placed below CMP' },
+  grid_spacing_pct:  { label: 'Grid Spacing %',     type: 'float', min: 0.1, max: 5, step: 0.1,  hint: 'Distance between each grid level as % of price' },
+  tp_pct:            { label: 'Take Profit %',      type: 'float', min: 0.1, max: 20, step: 0.1, hint: 'Profit target per grid cycle' },
+  sl_boundary_pct:   { label: 'SL Boundary %',      type: 'float', min: 0.5, max: 20, step: 0.5, hint: 'Flatten entire grid if price drops this % from lowest level' },
+  atr_multiplier:    { label: 'ATR Multiplier',     type: 'float', min: 0.1, max: 5,  step: 0.05, hint: 'Multiplier applied to ATR for dynamic spacing (0 = use fixed spacing)' },
+  entry_period:      { label: 'Entry Period (bars)', type: 'int',   min: 1, max: 200, step: 1 },
+  exit_period:       { label: 'Exit Period (bars)',  type: 'int',   min: 1, max: 200, step: 1 },
+  atr_period:        { label: 'ATR Period',          type: 'int',   min: 1, max: 50,  step: 1 },
+  rsi_min:           { label: 'RSI Min',             type: 'int',   min: 1, max: 100, step: 1 },
+  rsi_max:           { label: 'RSI Max',             type: 'int',   min: 1, max: 100, step: 1 },
+  trend_period:      { label: 'Trend Period',        type: 'int',   min: 1, max: 500, step: 1 },
+  vol_filter:        { label: 'Volume Filter',       type: 'float', min: 0.1, max: 5, step: 0.1 },
+  zscore_period:     { label: 'Z-Score Period',      type: 'int',   min: 5, max: 100, step: 1 },
+  zscore_threshold:  { label: 'Z-Score Threshold',  type: 'float', min: 0.5, max: 5, step: 0.1 },
+  rsi_period:        { label: 'RSI Period',          type: 'int',   min: 2, max: 50,  step: 1 },
+  rsi_threshold:     { label: 'RSI Threshold',       type: 'int',   min: 1, max: 50,  step: 1 },
+  exit_zscore:       { label: 'Exit Z-Score',        type: 'float', min: -3, max: 3,  step: 0.1 },
+  ema_fast:          { label: 'EMA Fast',            type: 'int',   min: 1, max: 50,  step: 1 },
+  ema_mid:           { label: 'EMA Mid',             type: 'int',   min: 1, max: 100, step: 1 },
+  ema_slow:          { label: 'EMA Slow',            type: 'int',   min: 1, max: 200, step: 1 },
+  macd_fast:         { label: 'MACD Fast',           type: 'int',   min: 1, max: 50,  step: 1 },
+  macd_slow:         { label: 'MACD Slow',           type: 'int',   min: 1, max: 100, step: 1 },
+  macd_signal:       { label: 'MACD Signal',         type: 'int',   min: 1, max: 50,  step: 1 },
+  volume_mult:       { label: 'Volume Multiplier',   type: 'float', min: 0.1, max: 5, step: 0.1 },
+  low_lookback:      { label: 'Low Lookback (bars)', type: 'int',   min: 10, max: 500, step: 1 },
+  proximity_pct:     { label: 'Proximity %',         type: 'float', min: 1, max: 50,  step: 1 },
+  target_pct:        { label: 'Target %',            type: 'float', min: 1, max: 50,  step: 1 },
+};
+
+/**
+ * Render editable parameter inputs for a library strategy's default_params.
+ * @param {string} containerId  — id of the container div
+ * @param {object} params       — the current param values (from lib.default_params or saved conditions.params)
+ * @param {string} prefix       — id prefix for inputs (e.g. 'nb', 'bt', 'bd')
+ */
+function renderParamInputs(containerId, params, prefix) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  if (!params || Object.keys(params).length === 0) {
+    container.innerHTML = '';
+    return;
+  }
+  const entries = Object.entries(params);
+  // Two columns for cleanliness
+  let html = `<div style="background:var(--surface-2);border-radius:8px;padding:12px 14px;margin-bottom:12px">
+    <div style="font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px">Strategy Parameters</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px">`;
+  for (const [key, val] of entries) {
+    const meta = PARAM_META[key] || { label: key.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase()), type: 'float', min: 0, step: 0.01 };
+    const inputType = 'number';
+    const step = meta.step || (meta.type === 'int' ? 1 : 0.1);
+    const min = meta.min !== undefined ? `min="${meta.min}"` : '';
+    const max = meta.max !== undefined ? `max="${meta.max}"` : '';
+    const hint = meta.hint ? `title="${meta.hint}"` : '';
+    html += `<div class="form-group" style="margin:0">
+      <label style="font-size:11px" ${hint}>${meta.label}</label>
+      <input type="${inputType}" id="${prefix}-param-${key}" value="${val}" step="${step}" ${min} ${max} style="font-size:13px">
+    </div>`;
+  }
+  html += `</div></div>`;
+  container.innerHTML = html;
+}
+
+/** Read current param input values from a rendered param container. */
+function readParamInputs(prefix, paramKeys) {
+  const result = {};
+  for (const key of paramKeys) {
+    const el = document.getElementById(`${prefix}-param-${key}`);
+    if (!el) continue;
+    const meta = PARAM_META[key] || { type: 'float' };
+    result[key] = meta.type === 'int' ? parseInt(el.value) : parseFloat(el.value);
+  }
+  return result;
+}
+
+// ── New Bot: strategy change handler ───────────────────────────────────────
+function nbOnStrategyChange(stratId) {
+  const hintEl = document.getElementById('nb-strat-hint');
+  if (stratId === '__TEST__') {
+    if (hintEl) hintEl.textContent = 'Test strategy: buys immediately, sells on next bar';
+    document.getElementById('nb-params-container').innerHTML = '';
+    return;
+  }
+  const lib = (LIB_CACHE || []).find(l => l.id === stratId);
+  if (!lib) return;
+  if (hintEl) hintEl.textContent = lib.description || '';
+  renderParamInputs('nb-params-container', lib.default_params || {}, 'nb');
+}
+
+// ── Backtester: strategy change handler ────────────────────────────────────
+function btOnStrategyChange(stratId) {
+  const lib = (LIB_CACHE || []).find(l => l.id === stratId);
+  if (!lib) { document.getElementById('bt-params-container').innerHTML = ''; return; }
+  renderParamInputs('bt-params-container', lib.default_params || {}, 'bt');
+}
+
+// ── Bot Settings: load params for current bot ──────────────────────────────
+function bdLoadParamEditor(bot) {
+  const lib = (LIB_CACHE || []).find(l => l.id === bot.library_id);
+  const savedParams = (bot.conditions && bot.conditions.params) ? bot.conditions.params : {};
+  // Merge: saved values override library defaults
+  const baseParams = lib ? (lib.default_params || {}) : {};
+  const mergedParams = { ...baseParams, ...savedParams };
+  renderParamInputs('bd-params-container', mergedParams, 'bd');
+}
+
+/** Read current param values from the bd (Bot Settings) param editor. */
+function bdReadParams() {
+  const container = document.getElementById('bd-params-container');
+  if (!container || !container.innerHTML) return null;
+  const inputs = container.querySelectorAll('input[id^="bd-param-"]');
+  if (!inputs.length) return null;
+  const result = {};
+  inputs.forEach(el => {
+    const key = el.id.replace('bd-param-', '');
+    const meta = PARAM_META[key] || { type: 'float' };
+    result[key] = meta.type === 'int' ? parseInt(el.value) : parseFloat(el.value);
+  });
+  return result;
 }
 
 /* ── Toast ─────────────────────────────────────────────────────────── */
@@ -2651,12 +2782,19 @@ async function createBot(andDeploy = false) {
   const lib = (LIB_CACHE || []).find(l => l.id === strat);
   const ts4 = Date.now().toString(36).slice(-4).toUpperCase();
   const sid = stratId + '_' + ts4;
+  // Build conditions: use library definition, override params with user inputs
+  let conditions = isTest ? {type: 'quick_test'} : (lib ? JSON.parse(JSON.stringify(lib.conditions || {})) : {});
+  if (!isTest && lib && lib.default_params && Object.keys(lib.default_params).length) {
+    const userParams = readParamInputs('nb', Object.keys(lib.default_params));
+    if (conditions.params) Object.assign(conditions.params, userParams);
+    else conditions.params = userParams;
+  }
   try {
     const payload = {
       email: EMAIL, strategy_id: sid, strategy_name: name, symbol: sym,
       arena: sym.endsWith('.HK') ? 'HK' : sym.endsWith('.SI') ? 'SG' : 'US',
       timeframe: tf,
-      conditions: isTest ? {type: 'quick_test'} : {},
+      conditions: conditions,
       exit_rules: {}, risk: isTest ? {lots: 100, tp_pct: 1, sl_pct: 2} : (lib ? lib.default_risk || {} : {}),
       is_active: false, mode: 'library', library_id: isTest ? 'QUICK_TEST' : strat,
       custom_script: '',
@@ -2740,6 +2878,8 @@ function openBotDetail(sid) {
       .catch(() => {});
   }
   document.getElementById('bd-set-strat').value = _currentBot.library_id || _currentBot.mode || '—';
+  // Load strategy param editor for library bots
+  bdLoadParamEditor(_currentBot);
   hideDeleteConfirm();
   // Load live trades
   loadBotLiveTrades();
@@ -2998,12 +3138,18 @@ async function saveBotSettings() {
   const alloc = document.getElementById('bd-set-alloc').value;
   try {
     // Re-save the strategy with updated fields
+    // Merge edited strategy params back into conditions
+    const updatedConditions = JSON.parse(JSON.stringify(_currentBot.conditions || {}));
+    const editedParams = bdReadParams();
+    if (editedParams) {
+      updatedConditions.params = editedParams;
+    }
     const r = await fetch(API + '/api/strategy', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         email: EMAIL, strategy_id: _currentBot.strategy_id, strategy_name: name, symbol: sym,
         arena: sym.endsWith('.HK') ? 'HK' : sym.endsWith('.SI') ? 'SG' : 'US',
-        timeframe: _currentBot.timeframe || '1day', conditions: _currentBot.conditions || {},
+        timeframe: _currentBot.timeframe || '1day', conditions: updatedConditions,
         exit_rules: _currentBot.exit_rules || {}, risk: { ..._currentBot.risk, sl_pct: parseFloat(document.getElementById('bd-set-sl').value) || 5, tp_pct: parseFloat(document.getElementById('bd-set-tp').value) || 10, lots: parseInt(document.getElementById('bd-set-lots') ? document.getElementById('bd-set-lots').value : '1') || 1 },
         is_active: _currentBot.is_active, mode: _currentBot.mode || 'library', library_id: _currentBot.library_id || ''
       })
@@ -3177,7 +3323,15 @@ async function runBacktest() {
   if (prog) prog.style.display = 'flex';
   if (progMsg) progMsg.textContent = msgs[0];
   const msgInt = setInterval(() => { mi = (mi + 1) % msgs.length; if (progMsg) progMsg.textContent = msgs[mi]; }, 2000);
-  const btPayload = JSON.stringify({ symbol: sym, strategy: strat, params: {}, initial_capital: cap, timeframe: tf, limit: _btLimit, email: EMAIL, broker_hint: _btBroker, skip_cache: false, commission_pct: parseFloat(document.getElementById('bt-commission')?.value||'0.1'), slippage_pct: parseFloat(document.getElementById('bt-slippage')?.value||'0.05') });
+  const btPayload = (() => {
+    // Read params from rendered param inputs if present
+    const lib = (LIB_CACHE || []).find(l => l.id === strat);
+    const defaultParams = (lib && lib.default_params) ? lib.default_params : {};
+    const params = Object.keys(defaultParams).length
+      ? readParamInputs('bt', Object.keys(defaultParams))
+      : {};
+    return JSON.stringify({ symbol: sym, strategy: strat, params, initial_capital: cap, timeframe: tf, limit: _btLimit, email: EMAIL, broker_hint: _btBroker, skip_cache: false, commission_pct: parseFloat(document.getElementById('bt-commission')?.value||'0.1'), slippage_pct: parseFloat(document.getElementById('bt-slippage')?.value||'0.05') });
+  })();
   let btBase = getBacktestBaseUrl();
   try {
     console.log('[BT] Running on:', btBase);
@@ -3343,14 +3497,25 @@ function clearSavedBacktests() {
 function createBotFromBacktest() {
   const sym = document.getElementById('bt-symbol').value;
   const strat = document.getElementById('bt-strategy').value;
-  // Open modal first (initializes quicktags etc), then pre-fill AFTER
+  // Read current param inputs from backtester before opening modal
+  const lib = (LIB_CACHE || []).find(l => l.id === strat);
+  const currentParams = (lib && lib.default_params && Object.keys(lib.default_params).length)
+    ? readParamInputs('bt', Object.keys(lib.default_params))
+    : null;
   openNewBot();
-  // Set values after modal init so broker pill switch doesn't clear them
   setTimeout(() => {
     document.getElementById('nb-symbol').value = sym;
     document.getElementById('nb-strategy').value = strat;
     document.getElementById('nb-name').value = strat + ' ' + sym;
     nbSelectSymbol(sym, '');
+    // Trigger strategy change to render params, then fill with backtest values
+    nbOnStrategyChange(strat);
+    if (currentParams) {
+      for (const [key, val] of Object.entries(currentParams)) {
+        const el = document.getElementById(`nb-param-${key}`);
+        if (el) el.value = val;
+      }
+    }
   }, 50);
 }
 
