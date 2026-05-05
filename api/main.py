@@ -1090,10 +1090,41 @@ async def options_backtest_stream(request: Request):
     """SSE streaming backtest for options strategies (vertical spreads, condors, etc.)."""
     config = await request.json()
 
+    # ── Cache check (non-streaming fast path) ─────────────────────────────
+    from api.database import _options_bt_cache_key, get_backtest_cache, set_backtest_cache
+    _cache_key = _options_bt_cache_key(config)
+    _cached = get_backtest_cache(_cache_key, ttl_hours=24)
+    if _cached is not None:
+        # Replay the cached result as SSE: start -> trades -> complete
+        def _cached_stream():
+            trade_log = _cached.get("trade_log", [])
+            metrics = _cached.get("metrics", {})
+            yield f"data: {json.dumps({'type': 'start', 'total': len(trade_log), 'cached': True})}\n\n"
+            for trade in trade_log:
+                yield f"data: {json.dumps({'type': 'trade', 'trade': trade}, default=str)}\n\n"
+            yield f"data: {json.dumps({'type': 'complete', 'metrics': metrics, 'trade_log': trade_log, '_cached': True}, default=str)}\n\n"
+        return StreamingResponse(_cached_stream(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    # ── Live compute path ─────────────────────────────────────────────────
     def event_stream():
         from api.options_backtest import run_options_backtest_stream
+        collected_trades: list = []
         try:
             for event in run_options_backtest_stream(config):
+                if event.get("type") == "trade":
+                    collected_trades.append(event.get("trade"))
+                elif event.get("type") == "complete":
+                    try:
+                        set_backtest_cache(
+                            _cache_key,
+                            {"metrics": event.get("metrics", {}),
+                             "trade_log": event.get("trade_log", collected_trades)},
+                            strategy=config.get("strategy_type", ""),
+                            symbol=config.get("symbol", ""),
+                        )
+                    except Exception:
+                        pass
                 yield f"data: {json.dumps(event, default=str)}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
