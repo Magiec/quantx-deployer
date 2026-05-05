@@ -1,14 +1,18 @@
 """QuantX Deployer — Unified master bot script generator."""
 
 import json
-import re
-from datetime import datetime
-from .bot_template_lp_options import LP_OPTIONS_BOT_TEMPLATE
+import hashlib
 from pathlib import Path
 
 from .bot_template import BOT_TEMPLATE
-from .bot_template_simple import SIMPLE_LP_TEMPLATE
+from .bot_template_ibkr import IBKR_BOT_TEMPLATE
+from .bot_template_simple import SIMPLE_LP_TEMPLATE, SIMPLE_IBKR_TEMPLATE
+from .bot_template_ibkr_prod import IBKR_PROD_TEMPLATE
 from .bot_template_lp_master import LP_MASTER_TEMPLATE
+try:
+    from .bot_template_options import OPTIONS_BOT_TEMPLATE
+except ImportError:
+    OPTIONS_BOT_TEMPLATE = None
 from .config import BOTS_DIR, LOGS_DIR, TRADES_DIR, STATE_DIR
 
 
@@ -42,6 +46,37 @@ def generate_master_bot(email: str, strategies: list[dict], credentials: dict) -
     return str(script_path.resolve())
 
 
+def generate_ibkr_bot(email: str, strategies: list[dict], credentials: dict,
+                      ibkr_config: dict) -> str:
+    """Generate an IBKR master bot script."""
+    BOTS_DIR.mkdir(parents=True, exist_ok=True)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+    email_safe = email.replace("@", "_at_").replace(".", "_")
+    script_path = BOTS_DIR / f"{email_safe}_ibkr_master.py"
+    master_log_name = f"{email_safe}_ibkr_master.log"
+
+    strategies_json = json.dumps(strategies, indent=4)
+    strategies_json = strategies_json.replace(": true", ": True")
+    strategies_json = strategies_json.replace(": false", ": False")
+    strategies_json = strategies_json.replace(": null", ": None")
+
+    content = IBKR_BOT_TEMPLATE.format(
+        email=email,
+        student_name=credentials.get("name", ""),
+        central_api_url=credentials.get("central_api_url", ""),
+        ibkr_host=ibkr_config.get("host", "127.0.0.1"),
+        ibkr_port=ibkr_config.get("port", 7497),
+        ibkr_client_id=ibkr_config.get("client_id", 1),
+        strategies_json=strategies_json,
+        log_dir=str(LOGS_DIR).replace("\\", "/"),
+        master_log_name=master_log_name,
+    )
+
+    script_path.write_text(content, encoding="utf-8")
+    return str(script_path.resolve())
+
+
 # ── Simple bot generators (for test orders) ─────────────────────────────────
 
 def generate_simple_lp_bot(email: str, symbol: str, credentials: dict) -> tuple[str, str]:
@@ -61,6 +96,35 @@ def generate_simple_lp_bot(email: str, symbol: str, credentials: dict) -> tuple[
     script_path.write_text(content, encoding="utf-8")
     # Verify template was filled correctly
     assert email in script_path.read_text(encoding="utf-8"), "Template fill failed for LP bot"
+    return str(script_path.resolve()), str(LOGS_DIR / log_name)
+
+
+def generate_simple_ibkr_bot(email: str, symbol: str, ibkr_config: dict,
+                             credentials: dict) -> tuple[str, str]:
+    """Generate a simple IBKR bot that places one test order.
+    Returns (script_path, log_path)."""
+    BOTS_DIR.mkdir(parents=True, exist_ok=True)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    email_safe = email.replace("@", "_at_").replace(".", "_")
+    # Auto-assign unique client ID from symbol hash to avoid conflicts
+    import hashlib
+    cid_hash = int(hashlib.md5((email + symbol).encode()).hexdigest(), 16) % 800 + 100
+    cid = ibkr_config.get("client_id", cid_hash) if ibkr_config.get("client_id", 1) == 1 else ibkr_config["client_id"]
+    if cid <= 10:
+        cid = cid_hash  # override low default IDs
+    script_path = BOTS_DIR / f"{email_safe}_simple_ibkr_{cid}.py"
+    log_name = f"{email_safe}_simple_ibkr_{cid}.log"
+    content = SIMPLE_IBKR_TEMPLATE
+    content = content.replace('__EMAIL__', email)
+    content = content.replace('__SYMBOL__', symbol)
+    content = content.replace('__IBKR_HOST__', ibkr_config.get("host", "127.0.0.1"))
+    content = content.replace('__IBKR_PORT__', str(ibkr_config.get("port", 7497)))
+    content = content.replace('__IBKR_CLIENT_ID__', str(cid))
+    content = content.replace('__CENTRAL_API_URL__', credentials.get("central_api_url", ""))
+    content = content.replace('__LOG_DIR__', str(LOGS_DIR).replace("\\", "/"))
+    content = content.replace('__LOG_NAME__', log_name)
+    script_path.write_text(content, encoding="utf-8")
+    assert email in script_path.read_text(encoding="utf-8"), "Template fill failed for IBKR bot"
     return str(script_path.resolve()), str(LOGS_DIR / log_name)
 
 
@@ -95,7 +159,7 @@ def library_id_to_conditions(library_id: str) -> dict:
     }
 
 
-# ── Indicator calc lookup table ─────────────────────────────────────────────
+# ── IBKR production bot generator ───────────────────────────────────────────
 
 _IND_CALC = {
     'ema': lambda p: f'calc_ema(close, {p.get("period",20)})',
@@ -156,55 +220,9 @@ def _cond_code(cond, lv, rv, is_value=False):
     return 'True'
 
 
-def _normalize_conditions(raw):
-    """Accept either:
-      - flat list:    [{"left":..., "cond":..., "right":...}, ...]
-      - Studio wrap:  {"conditions": [...], "logic": "AND"}
-
-    Also normalise per-condition key names inside left/right dicts:
-      "id" -> "ind"   (Studio uses "id", legacy code expects "ind")
-      "p"  -> "params" (Studio uses "p", legacy code expects "params")
-
-    Returns (flat_list, logic_string).
-    """
-    if isinstance(raw, dict):
-        logic = raw.get("logic", "AND")
-        items = raw.get("conditions", [])
-    elif isinstance(raw, list):
-        logic = "AND"
-        items = raw
-    else:
-        return [], "AND"
-
-    normalized = []
-    for c in items:
-        nc = dict(c)
-        for side_key in ("left", "right"):
-            if side_key in nc and isinstance(nc[side_key], dict):
-                s = dict(nc[side_key])
-                if "id" in s and "ind" not in s:
-                    s["ind"] = s.pop("id")
-                if "p" in s and "params" not in s:
-                    s["params"] = s.pop("p")
-                nc[side_key] = s
-        normalized.append(nc)
-    return normalized, logic
-
-
 def generate_signal_code(entry_long, exit_long, entry_short=None, exit_short=None,
                          entry_long_logic='AND', exit_long_logic='OR', has_short=False):
     """Convert builder conditions to compute_signals() Python function."""
-    # Normalize all condition inputs (handles both flat list and Studio wrapped format)
-    entry_long,  el_logic = _normalize_conditions(entry_long  or [])
-    exit_long,   xl_logic = _normalize_conditions(exit_long   or [])
-    entry_short, es_logic = _normalize_conditions(entry_short or [])
-    exit_short,  xs_logic = _normalize_conditions(exit_short  or [])
-
-    # Override logic strings only if the wrapped format provided them explicitly.
-    # Defaults remain whatever the caller passed; Studio wrappers carry their own.
-    if el_logic != 'AND': entry_long_logic = el_logic
-    if xl_logic != 'OR':  exit_long_logic  = xl_logic
-
     all_conds = list(entry_long or []) + list(exit_long or [])
     if has_short:
         all_conds += list(entry_short or []) + list(exit_short or [])
@@ -298,21 +316,83 @@ def generate_signal_code(entry_long, exit_long, entry_short=None, exit_short=Non
 
     lines.append("")
     lines.append("    return signals")
-    import textwrap
-    code = "\n".join(lines)
-    # Normalize: replace tabs with 4 spaces, ensure no trailing whitespace per line
-    code = "\n".join(line.replace("\t", "    ").rstrip() for line in code.splitlines())
-    return code
+    return "\n".join(lines)
+
+
+def generate_ibkr_bot_prod(email: str, strategy_config: dict,
+                           ibkr_config: dict) -> tuple[str, str, str]:
+    """Generate a production IBKR bot script.
+    Returns (script_path, log_path, trades_path)."""
+    BOTS_DIR.mkdir(parents=True, exist_ok=True)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    TRADES_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    email_safe = email.replace("@", "_at_").replace(".", "_")
+    sid = strategy_config.get("strategy_id", "CUSTOM")
+    cid = int(hashlib.md5((email + strategy_config.get("symbol", "")).encode()).hexdigest(), 16) % 800 + 100
+
+    script_path = BOTS_DIR / f"{email_safe}_{sid}_ibkr.py"
+    log_name = f"{sid}.log"
+    trades_path = str(TRADES_DIR / f"trades_{sid}_all.csv")
+
+    # Generate signal code
+    signal_code = generate_signal_code(
+        entry_long=strategy_config.get("entry_long", []),
+        exit_long=strategy_config.get("exit_long", []),
+        entry_short=strategy_config.get("entry_short", []),
+        exit_short=strategy_config.get("exit_short", []),
+        entry_long_logic=strategy_config.get("entry_long_logic", "AND"),
+        exit_long_logic=strategy_config.get("exit_long_logic", "OR"),
+        has_short=strategy_config.get("has_short", False),
+    )
+
+    content = IBKR_PROD_TEMPLATE
+    replacements = {
+        '__STRATEGY_NAME__': sid,
+        '__ACCOUNT_ID__': ibkr_config.get("account_id", ""),
+        '__PORT__': str(ibkr_config.get("port", 7497)),
+        '__CLIENT_ID__': str(cid),
+        '__EMAIL__': email,
+        '__CENTRAL_API_URL__': ibkr_config.get("central_api_url", ""),
+        '__SYMBOL__': strategy_config.get("symbol", "AAPL"),
+        '__SEC_TYPE__': strategy_config.get("sec_type", "STK"),
+        '__EXCHANGE__': strategy_config.get("exchange", "SMART"),
+        '__CURRENCY__': strategy_config.get("currency", "USD"),
+        '__LOT_SIZE__': str(strategy_config.get("lot_size", 1)),
+        '__MAX_CAPITAL__': str(strategy_config.get("max_capital", 1000)),
+        '__BAR_SIZE__': strategy_config.get("bar_size", "1 min"),
+        '__INTERVAL_MINUTES__': str(strategy_config.get("interval_minutes", 1)),
+        '__STOP_LOSS_PCT__': str(strategy_config.get("stop_loss_pct", 0.02)),
+        '__TAKE_PROFIT_PCT__': str(strategy_config.get("take_profit_pct", 0.05)),
+        '__HAS_SHORT__': str(strategy_config.get("has_short", False)),
+        '__KILL_SWITCH_PCT__': str(strategy_config.get("kill_switch_pct", 0.02)),
+        '__LOG_DIR__': str(LOGS_DIR).replace("\\", "/"),
+        '__TRADES_DIR__': str(TRADES_DIR).replace("\\", "/"),
+        '__STATE_DIR__': str(STATE_DIR).replace("\\", "/"),
+        '__SIGNAL_CODE__': signal_code,
+    }
+
+    for placeholder, value in replacements.items():
+        content = content.replace(placeholder, value)
+
+    script_path.write_text(content, encoding="utf-8")
+
+    # Verify
+    written = script_path.read_text(encoding="utf-8")
+    assert email in written, f"Template fill failed: email not in script"
+    import re
+    remaining = re.findall(r'__[A-Z_]{3,}__', written)
+    assert not remaining, f"Unfilled placeholders: {remaining}"
+
+    return str(script_path.resolve()), str(LOGS_DIR / log_name), trades_path
 
 
 # ── LongPort master bot generator (shared connections) ─────────────────────
 
 def generate_lp_master_bot(email: str, strategies: list[dict],
-                           lp_credentials: dict,
-                           initial_states: dict = None,
-                           dry_run: bool = False) -> tuple[str, str]:
+                           lp_credentials: dict) -> tuple[str, str]:
     """Generate one LP master bot handling multiple strategies with shared connections.
-    initial_states: {strategy_id: {position, entry_price, side}} for position preservation.
     Returns (script_path, log_path)."""
     BOTS_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -330,56 +410,41 @@ def generate_lp_master_bot(email: str, strategies: list[dict],
         sid = s.get("strategy_id", "CUSTOM")
         conds = s.get("conditions", {})
         library_id = s.get("library_id", "")
+        timeframe = s.get("timeframe", "1day")
 
-        # Grid strategies don't use compute_signals_XXXX -- GridState handles them
-        # at runtime, so we skip code generation entirely.
+        # Grid strategies are event-driven — no signal function needed
         is_grid = (library_id == "SYMMETRIC_GRID" or
                    conds.get("type") == "SYMMETRIC_GRID")
 
         if not is_grid:
-            # If library strategy, convert to Builder conditions
+            # If library strategy without entry_long, convert to Builder conditions
             if not conds.get("entry_long") and library_id:
                 conds = library_id_to_conditions(library_id)
-
-            # Studio wraps conditions as {"conditions":[...], "logic":...} -- a bare
-            # bool() check on that dict is True even when the conditions list is
-            # empty, falsely flagging short-side trading.
-            raw_es = conds.get("entry_short", [])
-            if isinstance(raw_es, dict):
-                has_short = bool(raw_es.get("conditions", []))
-            else:
-                has_short = bool(raw_es)
 
             fn_code = generate_signal_code(
                 entry_long=conds.get("entry_long", []),
                 exit_long=conds.get("exit_long", []),
-                entry_short=raw_es,
+                entry_short=conds.get("entry_short", []),
                 exit_short=conds.get("exit_short", []),
                 entry_long_logic=conds.get("entry_long_logic", "AND"),
                 exit_long_logic=conds.get("exit_long_logic", "OR"),
-                has_short=has_short,
+                has_short=bool(conds.get("entry_short")),
             )
-            # Rename compute_signals -> compute_signals_XXXX
             fn_code = fn_code.replace("def compute_signals(", f"def compute_signals_{sid}(")
             signal_functions.append(f"# Strategy: {sid} ({s.get('symbol', '?')})")
             signal_functions.append(fn_code)
             signal_functions.append("")
 
         risk = s.get("risk", {})
-        from .config import normalize_timeframe
-        tf = normalize_timeframe(s.get("timeframe", "1d"))
-        state = (initial_states or {}).get(sid, {})
         strategies_meta.append({
             "strategy_id": sid,
             "symbol": s.get("symbol", ""),
             "arena": s.get("arena", "HK"),
-            "timeframe": tf,
+            "timeframe": timeframe,
             "library_id": library_id,
             "conditions": conds,
             "risk": risk,
             "has_short": bool(conds.get("entry_short")),
-            "initial_position": int(state.get("position", state.get("current_position", 0))),
-            "initial_entry_price": float(state.get("entry_price", 0.0)),
         })
 
     # Build strategies list as Python literal
@@ -387,33 +452,6 @@ def generate_lp_master_bot(email: str, strategies: list[dict],
     strats_json = strats_json.replace(": true", ": True")
     strats_json = strats_json.replace(": false", ": False")
     strats_json = strats_json.replace(": null", ": None")
-
-    # Load custom indicators from DB and inject into generated script
-    custom_code_blocks = []
-    try:
-        from .database import get_db, get_custom_indicators
-        conn = get_db()
-        customs = get_custom_indicators(conn, email)
-        conn.close()
-        for ind in customs:
-            code = ind.get("calc_code", "")
-            if code:
-                custom_code_blocks.append(f"# Custom indicator: {ind.get('name', ind['indicator_id'])}")
-                custom_code_blocks.append(code)
-                custom_code_blocks.append("")
-    except Exception as e:
-        import logging
-        logging.getLogger("quantx-generate").warning("Custom indicator load failed: %s", e)
-
-    if custom_code_blocks:
-        signal_functions = custom_code_blocks + [""] + signal_functions
-
-    # Verify all signal functions compile cleanly before injecting
-    combined_signals = "\n".join(signal_functions)
-    try:
-        compile(combined_signals, "<signal_functions>", "exec")
-    except SyntaxError as e:
-        raise ValueError(f"Generated signal function has syntax error: {e}\n\nCode:\n{combined_signals}") from e
 
     content = LP_MASTER_TEMPLATE
     replacements = {
@@ -429,7 +467,6 @@ def generate_lp_master_bot(email: str, strategies: list[dict],
         '__STRATEGY_COUNT__': str(len(strategies_meta)),
         '__STRATEGIES_LIST__': strats_json,
         '__SIGNAL_FUNCTIONS__': "\n".join(signal_functions),
-        '__DRY_RUN__': 'True' if dry_run else 'False',
     }
 
     for placeholder, value in replacements.items():
@@ -447,266 +484,86 @@ def generate_lp_master_bot(email: str, strategies: list[dict],
     return str(script_path.resolve()), str(LOGS_DIR / log_name)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# LongPort Options Bot Generator (Options Studio -> deployable bot)
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Options bot generator ────────────────────────────────────────────────────
 
-def generate_lp_options_bot(config: dict, student: dict, paths: dict) -> str:
-    """
-    Generate a LongPort options bot script from Options Studio config.
+def generate_options_bot(email: str, options_config: dict,
+                         ibkr_config: dict) -> tuple[str, str, str]:
+    """Generate a production options bot script (SPX 0DTE etc).
+    Returns (script_path, log_path, trades_path)."""
+    if OPTIONS_BOT_TEMPLATE is None:
+        raise ValueError("Options bot template not available")
 
-    config  -- Options Studio backtest config (same keys as run_options_backtest)
-    student -- {email, app_key, app_secret, access_token, central_api_url}
-    paths   -- {log_dir, trades_dir, state_dir, script_path}
-    Returns -- the generated Python script as a string.
-    """
-    import json
-    from pathlib import Path
+    BOTS_DIR.mkdir(parents=True, exist_ok=True)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    TRADES_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-    template_path = Path(__file__).parent / "bot_template_lp_options.py"
-    if not template_path.exists():
-        raise FileNotFoundError(f"Template not found: {template_path}")
+    email_safe = email.replace("@", "_at_").replace(".", "_")
+    sid = options_config.get("strategy_id", "OPT_CUSTOM")
+    cid = int(hashlib.md5((email + sid).encode()).hexdigest(), 16) % 800 + 100
 
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("tpl_lp_opt", template_path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    template = mod.LP_OPTIONS_BOT_TEMPLATE
+    script_path = BOTS_DIR / f"{email_safe}_{sid}_opt.py"
+    log_name = f"{sid}.log"
+    trades_path = str(TRADES_DIR / f"trades_{sid}_all.csv")
 
-    strategy_type = config.get("strategy_type", "SHORT_PUT_SPREAD")
-    strike_method = config.get("short_strike_method", "DELTA")
-
-    custom_legs = config.get("custom_legs", [])
-    custom_legs_repr = json.dumps(custom_legs, indent=2) if custom_legs else "[]"
-
-    entry_days = config.get("entry_days", ["Mon", "Tue", "Wed", "Thu", "Fri"])
-    entry_days_repr = repr(entry_days)
-
-    profit_target_pct = float(config.get("profit_target_pct", 50)) / 100.0
-    stop_loss_pct = float(config.get("stop_loss_pct", 200)) / 100.0
-    contracts = int(config.get("contracts", 1))
-    starting_capital = float(config.get("starting_capital", 10000))
-    max_daily_loss = starting_capital * 0.05  # 5% of capital
-
-    symbol_clean = config.get("symbol", "SPY").replace(".", "_")
-    strategy_name = (
-        f"{symbol_clean}_{strategy_type}_{config.get('target_dte', 7)}DTE"
-        .replace("__", "_").upper()
-    )
-
-    subs = {
-        "__STRATEGY_NAME__":       strategy_name,
-        "__EMAIL__":               student.get("email", ""),
-        "__CENTRAL_API_URL__":     student.get("central_api_url", ""),
-        "__APP_KEY__":             student.get("app_key", ""),
-        "__APP_SECRET__":          student.get("app_secret", ""),
-        "__ACCESS_TOKEN__":        student.get("access_token", ""),
-        "__UNDERLYING__":          config.get("symbol", "SPY") + ".US",
-        "__STRATEGY_TYPE__":       strategy_type,
-        "__STRIKE_METHOD__":       strike_method,
-        "__TARGET_DTE__":          str(int(config.get("target_dte", 7))),
-        "__DTE_TOLERANCE__":       str(int(config.get("dte_tolerance", 2))),
-        "__PUT_DELTA__":           str(float(config.get("short_strike_value", -0.30))),
-        "__CALL_DELTA__":          str(float(config.get("short_call_strike_value", 0.30))),
-        "__PUT_WING_WIDTH__":      str(float(config.get("wing_width_value", 5.0))),
-        "__CALL_WING_WIDTH__":     str(float(config.get("call_wing_width_value", 5.0))),
-        "__CUSTOM_LEGS__":         custom_legs_repr,
-        "__ENTRY_TIME_ET__":       config.get("entry_time", "09:45"),
-        "__EXIT_TIME_ET__":        config.get("exit_time", "15:45"),
-        "__ENTRY_DAYS__":          entry_days_repr,
-        "__PROFIT_TARGET_PCT__":   str(profit_target_pct),
-        "__STOP_LOSS_MULT__":      str(stop_loss_pct),
-        "__CONTRACTS__":           str(contracts),
-        "__MAX_DAILY_LOSS__":      str(max_daily_loss),
-        "__DRY_RUN__":             "True",  # always paper first
-        "__LOG_DIR__":             str(paths.get("log_dir", "./logs")),
-        "__TRADES_DIR__":          str(paths.get("trades_dir", "./trades")),
-        "__STATE_DIR__":           str(paths.get("state_dir", "./state")),
-    }
-
-    script = template
-    for placeholder, value in subs.items():
-        script = script.replace(placeholder, value)
-
-    remaining = [p for p in subs if p in script]
-    if remaining:
-        raise ValueError(f"Unsubstituted placeholders: {remaining}")
-    return script
-
-
-def save_lp_options_bot(config: dict, student: dict, output_path) -> str:
-    """Generate and save the bot script. Returns the script path as a string."""
-    from pathlib import Path
-    symbol_clean = config.get("symbol", "SPY").replace(".", "_")
-    strategy_type = config.get("strategy_type", "SHORT_PUT_SPREAD")
-    dte = config.get("target_dte", 7)
-
-    out = Path(output_path)
-    out.mkdir(parents=True, exist_ok=True)
-
-    script_name = f"bot_{symbol_clean}_{strategy_type}_{dte}DTE.py"
-    script_path = out / script_name
-
-    paths = {
-        "log_dir":    str(out / "logs"),
-        "trades_dir": str(out / "trades"),
-        "state_dir":  str(out / "state"),
-        "script_path": str(script_path),
-    }
-
-    script = generate_lp_options_bot(config, student, paths)
-    script_path.write_text(script, encoding="utf-8")
-    return str(script_path)
-# ─────────────────────────────────────────────────────────────────────────────
-# INSTRUCTIONS: make two changes to api/generate.py
-#
-# 1. Add these imports near the top (after "import json"):
-#
-#       import re
-#       from datetime import datetime
-#       from .bot_template_lp_options import LP_OPTIONS_BOT_TEMPLATE
-#
-# 2. Paste the function below at the END of the file.
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def save_lp_options_bot(config: dict, student: dict, output_path: str) -> str:
-    """Generate a LongPort options bot from an Options Studio config.
-
-    Writes two files to output_path/:
-      bot_{symbol}_{strategy}_{dte}DTE.py   — the runnable bot
-      bot_{symbol}_{strategy}_{dte}DTE.json — metadata for the orchestrator
-
-    Returns the absolute path to the .py script.
-    """
-    email        = student["email"]
-    app_key      = student["app_key"]
-    app_secret   = student["app_secret"]
-    access_token = student["access_token"]
-    central_url  = student.get("central_api_url", "")
-
-    symbol        = config["symbol"]
-    strategy_type = config["strategy_type"]
-    target_dte    = int(config.get("target_dte", 7))
-
-    # LP options need ".US" suffix
-    underlying   = symbol if symbol.endswith(".US") else f"{symbol}.US"
-    symbol_clean = symbol.replace(".US", "")
-    strategy_id  = f"OPT_{symbol_clean}_{strategy_type}_{target_dte}DTE"
-
-    out_dir = Path(output_path)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    script_path = out_dir / f"bot_{symbol_clean}_{strategy_type}_{target_dte}DTE.py"
-    meta_path   = out_dir / f"bot_{symbol_clean}_{strategy_type}_{target_dte}DTE.json"
-
-    dry_run     = config.get("dry_run", True)
-    custom_legs = config.get("custom_legs", [])
-
+    content = OPTIONS_BOT_TEMPLATE
     replacements = {
-        # String placeholders (template wraps in quotes already)
-        "__STRATEGY_NAME__":   strategy_id,
-        "__EMAIL__":           email,
-        "__CENTRAL_API_URL__": central_url,
-        "__APP_KEY__":         app_key,
-        "__APP_SECRET__":      app_secret,
-        "__ACCESS_TOKEN__":    access_token,
-        "__UNDERLYING__":      underlying,
-        "__STRATEGY_TYPE__":   strategy_type,
-        "__STRIKE_METHOD__":   config.get("strike_method", "DELTA"),
-        "__ENTRY_TIME_ET__":   config.get("entry_time_et", "09:45"),
-        "__EXIT_TIME_ET__":    config.get("exit_time_et", "15:45"),
-        "__LOG_DIR__":         str(LOGS_DIR).replace("\\", "/"),
-        "__TRADES_DIR__":      str(TRADES_DIR).replace("\\", "/"),
-        "__STATE_DIR__":       str(STATE_DIR).replace("\\", "/"),
-        # Python literal placeholders (no quotes in template)
-        "__TARGET_DTE__":        str(target_dte),
-        "__DTE_TOLERANCE__":     str(int(config.get("dte_tolerance", 2))),
-        "__PUT_DELTA__":         str(float(config.get("put_delta", -0.30))),
-        "__CALL_DELTA__":        str(float(config.get("call_delta",  0.30))),
-        "__PUT_WING_WIDTH__":    str(float(config.get("put_wing_width", 5.0))),
-        "__CALL_WING_WIDTH__":   str(float(config.get("call_wing_width", 5.0))),
-        "__PROFIT_TARGET_PCT__": str(float(config.get("profit_target_pct", 0.50))),
-        "__STOP_LOSS_MULT__":    str(float(config.get("stop_loss_mult", 2.0))),
-        "__CONTRACTS__":         str(int(config.get("contracts", 1))),
-        "__MAX_DAILY_LOSS__":    str(float(config.get("max_daily_loss", 5000))),
-        "__DRY_RUN__":           "True" if dry_run else "False",
-        "__ENTRY_DAYS__":        repr(config.get("entry_days", ["Mon","Tue","Wed","Thu","Fri"])),
-        "__CUSTOM_LEGS__":       repr(custom_legs),
+        '__STRATEGY_NAME__': sid,
+        '__ACCOUNT_ID__': ibkr_config.get("account_id", ""),
+        '__PORT__': str(ibkr_config.get("port", 7497)),
+        '__CLIENT_ID__': str(cid),
+        '__EMAIL__': email,
+        '__CENTRAL_API_URL__': ibkr_config.get("central_api_url", ""),
+        '__UNDERLYING__': options_config.get("underlying", "SPX"),
+        '__UNDERLYING_SEC_TYPE__': options_config.get("underlying_sec_type", "IND"),
+        '__UNDERLYING_EXCHANGE__': options_config.get("underlying_exchange", "CBOE"),
+        '__OPTION_TRADING_CLASS__': options_config.get("option_trading_class", "SPXW"),
+        '__STRATEGY_TYPE__': options_config.get("strategy_type", "IRON_CONDOR"),
+        '__STRIKE_METHOD__': options_config.get("strike_method", "DELTA"),
+        '__PUT_DELTA__': str(options_config.get("put_delta", -0.16)),
+        '__CALL_DELTA__': str(options_config.get("call_delta", 0.16)),
+        '__PUT_PCT_OTM__': str(options_config.get("put_pct_otm", 0.03)),
+        '__CALL_PCT_OTM__': str(options_config.get("call_pct_otm", 0.03)),
+        '__PUT_POINTS_OTM__': str(options_config.get("put_points_otm", 50)),
+        '__CALL_POINTS_OTM__': str(options_config.get("call_points_otm", 50)),
+        '__PUT_WING_WIDTH__': str(options_config.get("put_wing_width", 5.0)),
+        '__CALL_WING_WIDTH__': str(options_config.get("call_wing_width", 5.0)),
+        '__MULTIPLIER__': str(options_config.get("multiplier", 100)),
+        '__ENTRY_TIME_ET__': options_config.get("entry_time_et", "13:30"),
+        '__EXIT_TIME_ET__': options_config.get("exit_time_et", "15:59"),
+        '__RESTART_TIME_ET__': options_config.get("restart_time_et", "09:30"),
+        '__SMA_FILTER__': str(options_config.get("sma_filter", False)),
+        '__SMA_PERIOD__': str(options_config.get("sma_period", 4)),
+        '__SMA_DIRECTION__': options_config.get("sma_direction", "above"),
+        '__IV_FILTER__': str(options_config.get("iv_filter", False)),
+        '__MIN_VIX__': str(options_config.get("min_vix", 15)),
+        '__MAX_VIX__': str(options_config.get("max_vix", 40)),
+        '__SKIP_FOMC__': str(options_config.get("skip_fomc", False)),
+        '__RISK_PCT__': str(options_config.get("risk_pct", 0.02)),
+        '__MIN_CONTRACTS__': str(options_config.get("min_contracts", 1)),
+        '__MAX_CONTRACTS__': str(options_config.get("max_contracts", 10)),
+        '__ACCOUNT_EQUITY__': str(options_config.get("account_equity", 100000)),
+        '__PROFIT_TARGET_PCT__': str(options_config.get("profit_target_pct", 0.50)),
+        '__LOSS_LIMIT_MULT__': str(options_config.get("loss_limit_mult", 2.0)),
+        '__EOD_EXIT__': str(options_config.get("eod_exit", True)),
+        '__MAX_DAILY_LOSS__': str(options_config.get("max_daily_loss", 5000)),
+        '__MAX_ORDERS_PER_DAY__': str(options_config.get("max_orders_per_day", 2)),
+        '__DRY_RUN__': str(options_config.get("dry_run", True)),
+        '__LOG_DIR__': str(LOGS_DIR).replace("\\", "/"),
+        '__TRADES_DIR__': str(TRADES_DIR).replace("\\", "/"),
+        '__STATE_DIR__': str(STATE_DIR).replace("\\", "/"),
     }
 
-    content = LP_OPTIONS_BOT_TEMPLATE
     for placeholder, value in replacements.items():
         content = content.replace(placeholder, value)
 
-    remaining = re.findall(r'__[A-Z_]{3,}__', content)
-    if remaining:
-        raise ValueError(f"Unfilled placeholders in LP options template: {remaining}")
-
     script_path.write_text(content, encoding="utf-8")
 
-    # Metadata JSON — orchestrator reads this to decide what to run
-    meta = {
-        "strategy_id":    strategy_id,
-        "email":          email,
-        "symbol":         symbol_clean,
-        "underlying":     underlying,
-        "strategy_type":  strategy_type,
-        "target_dte":     target_dte,
-        "strike_method":  config.get("strike_method", "DELTA"),
-        "broker":         "longport",
-        "bot_type":       "lp_options",
-        "enabled":        True,
-        "dry_run":        dry_run,
-        "script_path":    str(script_path.resolve()),
-        "created_at":     datetime.utcnow().isoformat(),
-        "status":         "pending",
-        "pid":            None,
-        "last_heartbeat": None,
-    }
-    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    # Verify
+    written = script_path.read_text(encoding="utf-8")
+    assert email in written, "Template fill failed: email not in script"
+    import re
+    remaining = re.findall(r'__[A-Z_]{3,}__', written)
+    assert not remaining, f"Unfilled placeholders: {remaining}"
 
-    return str(script_path.resolve())
-
-# ── Self-test: run with `python api/generate.py` ─────────────────────────────
-if __name__ == "__main__":
-    # Test Studio format normalisation
-    raw = {"conditions": [{"left": {"id": "ema", "p": {"period": 5}},
-                            "cond": "crosses_above",
-                            "right": {"type": "indicator", "id": "ema", "p": {"period": 20}}}],
-           "logic": "AND"}
-    items, logic = _normalize_conditions(raw)
-    assert len(items) == 1
-    assert items[0]["left"]["ind"] == "ema"
-    assert items[0]["left"]["params"] == {"period": 5}
-    assert items[0]["right"]["ind"] == "ema"
-    assert logic == "AND"
-    print("_normalize_conditions: OK")
-
-    # Test that generate_signal_code produces valid Python with Studio format
-    code = generate_signal_code(
-        entry_long=raw,
-        exit_long={"conditions": [], "logic": "OR"},
-        entry_short={"conditions": [{"left": {"id": "ema", "p": {"period": 5}},
-                                       "cond": "crosses_below",
-                                       "right": {"type": "indicator", "id": "ema", "p": {"period": 20}}}],
-                     "logic": "AND"},
-        exit_short={"conditions": [], "logic": "OR"},
-        has_short=True,
-    )
-    assert "ema_5" in code, f"Expected ema_5 in code, got:\n{code}"
-    assert "ema_20" in code, "Expected ema_20 in code"
-    assert "crosses_above" not in code, "crosses_above should be lowered to a Python expression"
-    assert "def compute_signals" in code
-    compile(code, "<string>", "exec")  # raises SyntaxError if broken
-    print("generate_signal_code with Studio format: OK")
-
-    # Verify compile check catches bad code
-    try:
-        from api.generate import generate_lp_master_bot
-    except ImportError:
-        pass
-
-    # Verify generated code compiles cleanly
-    compile(code, "<test>", "exec")
-    print("Compile check: OK")
-    print("All checks passed.")
+    return str(script_path.resolve()), str(LOGS_DIR / log_name), trades_path
