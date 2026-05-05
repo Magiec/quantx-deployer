@@ -329,33 +329,41 @@ def generate_lp_master_bot(email: str, strategies: list[dict],
     for s in strategies:
         sid = s.get("strategy_id", "CUSTOM")
         conds = s.get("conditions", {})
-        # If library strategy, convert to Builder conditions
-        if not conds.get("entry_long") and s.get("library_id"):
-            conds = library_id_to_conditions(s["library_id"])
+        library_id = s.get("library_id", "")
 
-        # Studio wraps conditions as {"conditions":[...], "logic":...} -- a bare
-        # bool() check on that dict is True even when the conditions list is
-        # empty, falsely flagging short-side trading.
-        raw_es = conds.get("entry_short", [])
-        if isinstance(raw_es, dict):
-            has_short = bool(raw_es.get("conditions", []))
-        else:
-            has_short = bool(raw_es)
+        # Grid strategies don't use compute_signals_XXXX -- GridState handles them
+        # at runtime, so we skip code generation entirely.
+        is_grid = (library_id == "SYMMETRIC_GRID" or
+                   conds.get("type") == "SYMMETRIC_GRID")
 
-        fn_code = generate_signal_code(
-            entry_long=conds.get("entry_long", []),
-            exit_long=conds.get("exit_long", []),
-            entry_short=raw_es,
-            exit_short=conds.get("exit_short", []),
-            entry_long_logic=conds.get("entry_long_logic", "AND"),
-            exit_long_logic=conds.get("exit_long_logic", "OR"),
-            has_short=has_short,
-        )
-        # Rename compute_signals -> compute_signals_XXXX
-        fn_code = fn_code.replace("def compute_signals(", f"def compute_signals_{sid}(")
-        signal_functions.append(f"# Strategy: {sid} ({s.get('symbol', '?')})")
-        signal_functions.append(fn_code)
-        signal_functions.append("")
+        if not is_grid:
+            # If library strategy, convert to Builder conditions
+            if not conds.get("entry_long") and library_id:
+                conds = library_id_to_conditions(library_id)
+
+            # Studio wraps conditions as {"conditions":[...], "logic":...} -- a bare
+            # bool() check on that dict is True even when the conditions list is
+            # empty, falsely flagging short-side trading.
+            raw_es = conds.get("entry_short", [])
+            if isinstance(raw_es, dict):
+                has_short = bool(raw_es.get("conditions", []))
+            else:
+                has_short = bool(raw_es)
+
+            fn_code = generate_signal_code(
+                entry_long=conds.get("entry_long", []),
+                exit_long=conds.get("exit_long", []),
+                entry_short=raw_es,
+                exit_short=conds.get("exit_short", []),
+                entry_long_logic=conds.get("entry_long_logic", "AND"),
+                exit_long_logic=conds.get("exit_long_logic", "OR"),
+                has_short=has_short,
+            )
+            # Rename compute_signals -> compute_signals_XXXX
+            fn_code = fn_code.replace("def compute_signals(", f"def compute_signals_{sid}(")
+            signal_functions.append(f"# Strategy: {sid} ({s.get('symbol', '?')})")
+            signal_functions.append(fn_code)
+            signal_functions.append("")
 
         risk = s.get("risk", {})
         from .config import normalize_timeframe
@@ -366,6 +374,8 @@ def generate_lp_master_bot(email: str, strategies: list[dict],
             "symbol": s.get("symbol", ""),
             "arena": s.get("arena", "HK"),
             "timeframe": tf,
+            "library_id": library_id,
+            "conditions": conds,
             "risk": risk,
             "has_short": bool(conds.get("entry_short")),
             "initial_position": int(state.get("position", state.get("current_position", 0))),
