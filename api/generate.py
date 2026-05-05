@@ -309,7 +309,8 @@ def generate_signal_code(entry_long, exit_long, entry_short=None, exit_short=Non
 
 def generate_lp_master_bot(email: str, strategies: list[dict],
                            lp_credentials: dict,
-                           initial_states: dict = None) -> tuple[str, str]:
+                           initial_states: dict = None,
+                           dry_run: bool = False) -> tuple[str, str]:
     """Generate one LP master bot handling multiple strategies with shared connections.
     initial_states: {strategy_id: {position, entry_price, side}} for position preservation.
     Returns (script_path, log_path)."""
@@ -418,6 +419,7 @@ def generate_lp_master_bot(email: str, strategies: list[dict],
         '__STRATEGY_COUNT__': str(len(strategies_meta)),
         '__STRATEGIES_LIST__': strats_json,
         '__SIGNAL_FUNCTIONS__': "\n".join(signal_functions),
+        '__DRY_RUN__': 'True' if dry_run else 'False',
     }
 
     for placeholder, value in replacements.items():

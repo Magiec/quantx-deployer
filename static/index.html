@@ -2298,6 +2298,12 @@ async function loadBots() {
       // Don't revert running state if deployed within last 10s (process may still be starting)
       if (!recentDeploy || sd.lp_running) LP_BOT_RUNNING = sd.lp_running || false;
       BOT_RUNNING = LP_BOT_RUNNING;
+      // Propagate dry_run flag onto each active strategy for badge rendering
+      if (sd.dry_run !== undefined) {
+        for (const s of USER_STRATEGIES) {
+          if (s.is_active) s.dry_run = sd.dry_run;
+        }
+      }
       console.log('[STATUS] LP:', LP_BOT_RUNNING, 'recentDeploy:', recentDeploy);
     } catch (_) { if ((Date.now() - _deployedAt) > 10000) { BOT_RUNNING = LP_BOT_RUNNING = false; } }
     checkDuplicateBots();
@@ -2403,13 +2409,20 @@ let _deployedAt = 0; // timestamp of last deploy
 function _renderDeployBtn(s) {
   const isRunning = LP_BOT_RUNNING && s.is_active;
   if (s._toggling) return `<button class="deploy-btn deploy-btn-loading" disabled>\u27F3 ${s._toggling === 'deploy' ? 'Deploying...' : 'Stopping...'}</button>`;
-  if (isRunning) return `<button class="deploy-btn deploy-btn-on" onclick="event.stopPropagation();toggleBot('${s.strategy_id}',false)">\u25A0 Stop</button>`;
-  return `<button class="deploy-btn deploy-btn-off" onclick="event.stopPropagation();toggleBot('${s.strategy_id}',true)">\u25B6 Deploy</button>`;
+  if (isRunning) {
+    const dryBadge = s.dry_run ? ' <span style="background:#EDE9FE;color:#6D28D9;padding:1px 5px;border-radius:4px;font-size:10px;margin-left:4px">DRY</span>' : '';
+    return `<button class="deploy-btn deploy-btn-on" onclick="event.stopPropagation();toggleBot('${s.strategy_id}',false)">\u25A0 Stop</button>${dryBadge}`;
+  }
+  return `
+    <div style="display:flex;gap:6px">
+      <button class="deploy-btn deploy-btn-off" onclick="event.stopPropagation();toggleBot('${s.strategy_id}',true,false)" title="Deploy live">\u25B6 Deploy</button>
+      <button class="deploy-btn" style="background:#6D28D9;color:white;border:none;padding:6px 10px;border-radius:6px;cursor:pointer;font-size:12px" onclick="event.stopPropagation();toggleBot('${s.strategy_id}',true,true)" title="Simulate trades without real orders">\uD83E\uDDEA Dry Run</button>
+    </div>`;
 }
 
 let _pendingDeploySid = null;
 
-async function toggleBot(sid, active) {
+async function toggleBot(sid, active, dryRun=false) {
   const s = USER_STRATEGIES.find(x => x.strategy_id === sid);
   if (!s) return;
   const broker = s.broker || 'longport';
@@ -2462,7 +2475,7 @@ async function toggleBot(sid, active) {
           return;
         }
       } catch(e) { /* check failed, proceed with normal deploy */ }
-      await _executeDeploy(sid, '/api/deploy');
+      await _executeDeploy(sid, '/api/deploy', dryRun);
     } else {
       const sr = await fetch(API + '/api/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: EMAIL, broker: broker }) });
       if (!sr.ok) { const sd = await sr.json(); throw new Error(sd.detail || 'Stop failed'); }
@@ -2576,7 +2589,7 @@ function _hideDeployProgress(sid) {
   clearInterval(_deployBarInterval);
 }
 
-async function _executeDeploy(sid, endpoint) {
+async function _executeDeploy(sid, endpoint, dryRun=false) {
   const s = USER_STRATEGIES.find(x => x.strategy_id === sid);
   if (!s) return;
   const broker = s.broker || 'longport';
@@ -2585,7 +2598,7 @@ async function _executeDeploy(sid, endpoint) {
   if (cell) cell.innerHTML = _renderDeployBtn(s);
   _showDeployProgress(sid);
   try {
-    const dr = await fetch(API + endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: EMAIL }) });
+    const dr = await fetch(API + endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: EMAIL, dry_run: dryRun }) });
     if (!dr.ok) { const dd = await dr.json(); throw new Error(dd.detail || 'Deploy failed'); }
     const result = await dr.json();
     LP_BOT_RUNNING = true;

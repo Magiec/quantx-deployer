@@ -170,6 +170,7 @@ class ValidateScriptReq(BaseModel):
 
 class DeployReq(BaseModel):
     email: str
+    dry_run: bool = False
 
 
 class StopReq(BaseModel):
@@ -1976,9 +1977,10 @@ async def deploy(req: DeployReq):
     for pos in read_open_positions(email):
         existing_states[pos["strategy_id"]] = pos
 
+    dry_run = bool(getattr(req, "dry_run", False))
     try:
         script_path, log_path = generate_lp_master_bot(
-            email, lp_strats, lp_creds, initial_states=existing_states)
+            email, lp_strats, lp_creds, initial_states=existing_states, dry_run=dry_run)
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
@@ -1995,7 +1997,8 @@ async def deploy(req: DeployReq):
         proc = _launch_bot(script_path, log_path)
         _running_processes[email] = proc
         save_process(email, proc.pid, "running", script_path, log_path)
-        _log.info("[DEPLOY] LP master PID: %s (%d strategies, 2 connections)", proc.pid, len(lp_strats))
+        _log.info("[DEPLOY] LP master PID: %s (%d strategies, 2 connections, dry_run=%s)",
+                  proc.pid, len(lp_strats), dry_run)
 
         # Wait 3 seconds to check for immediate crash
         time.sleep(3)
@@ -2029,6 +2032,7 @@ async def deploy(req: DeployReq):
             "lp_connections": 2,
             "central_api_url": central_url,
             "old_orders_cancelled": old_cancelled,
+            "dry_run": dry_run,
         }
     except Exception as e:
         raise HTTPException(500, f"Failed to launch bot: {e}")
@@ -2446,6 +2450,19 @@ async def status(email: str):
     for t in trades:
         strat_pnl[t["strategy_id"]] += t["pnl"]
 
+    # Detect dry_run by reading the running bot script
+    dry_run_active = False
+    if lp_running:
+        try:
+            from api.config import BOTS_DIR
+            email_safe = email.replace("@", "_at_").replace(".", "_")
+            script_path = BOTS_DIR / f"{email_safe}_lp_master.py"
+            if script_path.exists():
+                head = script_path.read_text(encoding="utf-8", errors="replace")[:4000]
+                dry_run_active = "DRY_RUN    = True" in head or "DRY_RUN = True" in head
+        except Exception:
+            pass
+
     return {
         "email": email,
         "status": "running" if lp_running else "stopped",
@@ -2454,6 +2471,7 @@ async def status(email: str):
         "pid": lp_proc["pid"] if lp_running else None,
         "is_running": lp_running,
         "bot_status": "running" if lp_running else "stopped",
+        "dry_run": dry_run_active,
         "strategies": [
             {**s, "total_pnl": round(strat_pnl.get(s["strategy_id"], 0), 4)}
             for s in strategies

@@ -38,6 +38,8 @@ APP_KEY        = '__APP_KEY__'
 APP_SECRET     = '__APP_SECRET__'
 ACCESS_TOKEN   = '__ACCESS_TOKEN__'
 
+DRY_RUN    = __DRY_RUN__   # True = simulate orders, no real trades
+
 LOG_DIR    = '__LOG_DIR__'
 TRADES_DIR = '__TRADES_DIR__'
 STATE_DIR  = '__STATE_DIR__'
@@ -343,6 +345,8 @@ def main():
     logger.info('='*72)
     logger.info('QuantX LongPort Master Bot -- %s', EMAIL)
     logger.info('Strategies: %d', len(STRATEGIES))
+    if DRY_RUN:
+        logger.info('*** DRY RUN MODE -- no real orders will be placed ***')
     logger.info('='*72)
 
     # LongPort imports
@@ -358,8 +362,12 @@ def main():
     # ONE connection for everything
     cfg = Config(app_key=APP_KEY, app_secret=APP_SECRET, access_token=ACCESS_TOKEN)
     quote_ctx = QuoteContext(cfg)
-    trade_ctx = TradeContext(cfg)
-    logger.info('LongPort connected (2 connections: quote + trade)')
+    if DRY_RUN:
+        trade_ctx = None
+        logger.info('DRY RUN: QuoteContext connected (TradeContext skipped)')
+    else:
+        trade_ctx = TradeContext(cfg)
+        logger.info('LongPort connected (2 connections: quote + trade)')
 
     # Build strategy states with their compute_signals functions
     # The __SIGNAL_FUNCTIONS_BLOCK__ block defines compute_signals_XXXX for each strategy
@@ -412,7 +420,7 @@ def main():
 
     # Order placement helper using shared trade_ctx
     def place_order(st, action, signal='', bar_date='', indicator_values='', bar_close=0.0):
-        """Place a limit order 2% below/above market via shared trade_ctx."""
+        """Place a limit order (or simulate in DRY RUN mode)."""
         try:
             quotes = quote_ctx.quote([st.symbol])
             price = float(quotes[0].last_done) if quotes else 0
@@ -430,6 +438,33 @@ def main():
             else:
                 limit_price = round(price * (0.998 if action == 'BUY' else 1.002), 2)
 
+            # ── DRY RUN: simulate fill, no real order ──────────────────────
+            if DRY_RUN:
+                order_id = f'DRY_{st.sid}_{datetime.utcnow():%H%M%S%f}'
+                logger.info(
+                    f'[DRY RUN][{st.sid}] SIMULATED {action} {st.lot_size} '
+                    f'{st.symbol} @ {limit_price} | signal={signal}'
+                )
+                pnl = 0.0
+                if action == 'SELL' and st.current_position == 1 and st.entry_price > 0:
+                    pnl = (limit_price - st.entry_price) * st.lot_size
+                elif action == 'BUY' and st.current_position == -1 and st.entry_price > 0:
+                    pnl = (st.entry_price - limit_price) * st.lot_size
+                if action == 'BUY':
+                    st.current_position = 1
+                    st.entry_price = limit_price
+                else:
+                    st.current_position = 0
+                    st.entry_price = 0.0
+                st.save_state()
+                log_trade(st.sid, st.symbol,
+                          'DRY_BOT' if action == 'BUY' else 'DRY_SLD',
+                          st.lot_size, limit_price, pnl, signal,
+                          bar_date=bar_date, indicator_values=indicator_values,
+                          bar_close=bar_close, order_id=order_id)
+                return
+
+            # ── LIVE: submit real order ────────────────────────────────────
             side = OrderSide.Buy if action == 'BUY' else OrderSide.Sell
             resp = trade_ctx.submit_order(
                 symbol=st.symbol,
@@ -487,46 +522,47 @@ def main():
     # If LongPort shows FLAT but state file says we're in a position (e.g. after
     # a Railway restart while an order was pending), reset state to FLAT to avoid
     # ghost SL/TP orders on the next bar.
-    logger.info('Reconciling positions with LongPort...')
-    try:
-        lp_positions = {}
-        stock_positions = trade_ctx.stock_positions()
-        for pos in stock_positions.channels:
-            for p in pos.positions:
-                sym = str(p.symbol)
-                qty = int(p.quantity or 0)
-                lp_positions[sym] = qty
-        logger.info('LongPort positions: %s', lp_positions)
+    if DRY_RUN:
+        logger.info('DRY RUN: skipping position reconciliation (no TradeContext)')
+    else:
+        logger.info('Reconciling positions with LongPort...')
+        try:
+            lp_positions = {}
+            stock_positions = trade_ctx.stock_positions()
+            for pos in stock_positions.channels:
+                for p in pos.positions:
+                    sym = str(p.symbol)
+                    qty = int(p.quantity or 0)
+                    lp_positions[sym] = qty
+            logger.info('LongPort positions: %s', lp_positions)
 
-        for st in states:
-            lp_qty = lp_positions.get(st.symbol, 0)
-            if st.current_position == 1 and lp_qty == 0:
-                logger.warning(
-                    '[%s] State says LONG but LongPort shows FLAT -- resetting to FLAT',
-                    st.sid)
-                st.current_position = 0
-                st.entry_price = 0.0
-                st.save_state()
-            elif st.current_position == -1 and lp_qty == 0:
-                logger.warning(
-                    '[%s] State says SHORT but LongPort shows FLAT -- resetting to FLAT',
-                    st.sid)
-                st.current_position = 0
-                st.entry_price = 0.0
-                st.save_state()
-            elif st.current_position == 0 and lp_qty > 0:
-                # LongPort has a position we don't know about — log it but don't auto-set
-                # entry_price is unknown, so we leave state as FLAT and let student decide
-                logger.warning(
-                    '[%s] LongPort shows qty=%d for %s but state is FLAT -- '
-                    'manual review recommended. Bot will not place new entries until resolved.',
-                    st.sid, lp_qty, st.symbol)
-            else:
-                logger.info('[%s] Position OK: state=%d LongPort_qty=%d',
-                            st.sid, st.current_position, lp_qty)
-    except Exception as e:
-        logger.warning('Position reconciliation failed (non-fatal): %s', e)
-        logger.warning('Proceeding with state file positions. Manual verification recommended.')
+            for st in states:
+                lp_qty = lp_positions.get(st.symbol, 0)
+                if st.current_position == 1 and lp_qty == 0:
+                    logger.warning(
+                        '[%s] State says LONG but LongPort shows FLAT -- resetting to FLAT',
+                        st.sid)
+                    st.current_position = 0
+                    st.entry_price = 0.0
+                    st.save_state()
+                elif st.current_position == -1 and lp_qty == 0:
+                    logger.warning(
+                        '[%s] State says SHORT but LongPort shows FLAT -- resetting to FLAT',
+                        st.sid)
+                    st.current_position = 0
+                    st.entry_price = 0.0
+                    st.save_state()
+                elif st.current_position == 0 and lp_qty > 0:
+                    logger.warning(
+                        '[%s] LongPort shows qty=%d for %s but state is FLAT -- '
+                        'manual review recommended. Bot will not place new entries until resolved.',
+                        st.sid, lp_qty, st.symbol)
+                else:
+                    logger.info('[%s] Position OK: state=%d LongPort_qty=%d',
+                                st.sid, st.current_position, lp_qty)
+        except Exception as e:
+            logger.warning('Position reconciliation failed (non-fatal): %s', e)
+            logger.warning('Proceeding with state file positions. Manual verification recommended.')
 
     # Bar polling loop -- fetches new bars for ALL strategies
     def bar_loop():
@@ -596,7 +632,10 @@ def main():
     bar_t.start()
     hb_t.start()
 
-    logger.info('Bot is LIVE. %d strategies, %d symbols, 2 LP connections.', len(states), len(all_symbols))
+    mode_str = 'DRY RUN' if DRY_RUN else 'LIVE'
+    logger.info('Bot is %s. %d strategies, %d symbols, %s.',
+                mode_str, len(states), len(all_symbols),
+                '1 LP connection (quote only)' if DRY_RUN else '2 LP connections')
 
     try:
         while not _shutdown.is_set():
