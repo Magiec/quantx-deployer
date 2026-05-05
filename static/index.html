@@ -3170,16 +3170,19 @@ function openCloneBot(sid) {
   const s = USER_STRATEGIES.find(x => x.strategy_id === sid);
   if (!s) return;
   const isDry = !!(s.is_dry_run);
-  const targetMode = isDry ? 'Live' : 'Dry Run';
-  const targetIcon = isDry ? '🔴' : '🧪';
-  const confirmed = confirm(
-    `Clone "${s.strategy_name}" as ${targetIcon} ${targetMode}?\n\n` +
-    `A new bot will be created with the same strategy and parameters.\n` +
-    `Trade history starts fresh.\n\n` +
-    `Original bot: unchanged and still ${s.is_active ? 'running' : 'stopped'}.`
+  const currentMode = isDry ? '🧪 Dry Run' : '🔴 Live';
+  const otherMode = isDry ? '🔴 Live' : '🧪 Dry Run';
+  // Two options via confirm: OK = flip mode, Cancel = same mode
+  const choice = confirm(
+    `Clone "${s.strategy_name}"\nCurrent mode: ${currentMode}\n\n` +
+    `OK  →  Clone as ${otherMode} (switch mode)\n` +
+    `Cancel  →  Clone as ${currentMode} (same mode)\n\n` +
+    `Trade history starts fresh either way.`
   );
-  if (!confirmed) return;
-  cloneBot(sid, !isDry);
+  // null = dismissed (X button) → abort
+  if (choice === null) return;
+  const newIsDry = choice ? !isDry : isDry;
+  cloneBot(sid, newIsDry);
 }
 
 async function cloneBot(sid, newIsDry) {

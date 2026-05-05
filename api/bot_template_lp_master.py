@@ -549,7 +549,7 @@ class GridState:
             self.position_qty = 0
             return
 
-        from longport.openapi import OrderType, TimeInForceType
+        from longport.openapi import OrderSide, OrderType, TimeInForceType
         for lv in self.buy_levels:
             for key in ('order_id', 'tp_order_id'):
                 oid = lv.get(key, '')
@@ -563,7 +563,7 @@ class GridState:
 
         if self.position_qty > 0:
             try:
-                from longport.openapi import OrderType, TimeInForceType
+                from longport.openapi import OrderSide, OrderType, TimeInForceType
                 self.trade_ctx.submit_order(
                     symbol=self.symbol,
                     order_type=OrderType.MO,
@@ -598,7 +598,7 @@ class GridState:
             threading.Thread(target=_simulate_fill, daemon=True).start()
             return fake_oid
 
-        from longport.openapi import OrderType, TimeInForceType
+        from longport.openapi import OrderSide, OrderType, TimeInForceType
         try:
             side = OrderSide.Buy if action == 'BUY' else OrderSide.Sell
             resp = self.trade_ctx.submit_order(
